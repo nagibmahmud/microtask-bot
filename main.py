@@ -19,6 +19,10 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()}
 
 DATA_FILE = os.getenv("DATA_FILE", "data.json")
 
+PAYOUT_RATE = float(os.getenv("PAYOUT_RATE", "100"))
+MIN_PAYOUT = int(os.getenv("MIN_PAYOUT", "100"))
+CURRENCY = os.getenv("CURRENCY", "USD")
+
 lock = threading.Lock()
 
 
@@ -26,9 +30,19 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
+def points_to_currency(points):
+    return round(points / PAYOUT_RATE, 2)
+
+
 def load_data():
     if not os.path.exists(DATA_FILE):
-        return {"users": {}, "tasks": [], "next_task_id": 1}
+        return {
+            "users": {},
+            "tasks": [],
+            "next_task_id": 1,
+            "payouts": [],
+            "next_payout_id": 1,
+        }
     with open(DATA_FILE, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -51,6 +65,7 @@ def ensure_user(data, user):
             "first_name": user.first_name or "",
             "points": 0,
             "completed": [],
+            "wallet": "",
         }
     return data["users"][uid]
 
@@ -70,8 +85,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/mytasks - your claimed tasks\n"
         "/done <id> - submit a task for review\n"
         "/balance - your points\n"
-        "/leaderboard - top users\n\n"
-        "Admins can use /addtask, /verify, /broadcast."
+        "/leaderboard - top users\n"
+        "/setwallet <address> - set your payout address\n"
+        "/payout <points> - request a payout\n"
+        "/mypayouts - your payout history\n\n"
+        "Admins can use /addtask, /verify, /broadcast, /payouts, /approvepayout, /rejectpayout."
     )
 
 
@@ -206,6 +224,191 @@ async def leaderboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def setwallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text("Usage: /setwallet <your payout address>")
+        return
+    address = " ".join(context.args)
+    with lock:
+        data = load_data()
+        u = ensure_user(data, user)
+        u["wallet"] = address
+        save_data(data)
+    await update.message.reply_text(f"✅ Payout address saved: `{address}`", parse_mode="Markdown")
+
+
+async def payout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not context.args:
+        await update.message.reply_text("Usage: /payout <points>")
+        return
+    try:
+        amount = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid amount.")
+        return
+    with lock:
+        data = load_data()
+        u = ensure_user(data, user)
+        if not u["wallet"]:
+            await update.message.reply_text("Set a payout address first with /setwallet.")
+            return
+        if amount < MIN_PAYOUT:
+            await update.message.reply_text(
+                f"Minimum payout is {MIN_PAYOUT} points ({CURRENCY} {points_to_currency(MIN_PAYOUT)})."
+            )
+            return
+        if amount > u["points"]:
+            await update.message.reply_text(
+                f"Insufficient balance. You have {u['points']} points."
+            )
+            return
+        pid = data["next_payout_id"]
+        data["payouts"].append(
+            {
+                "id": pid,
+                "user_id": user.id,
+                "points": amount,
+                "address": u["wallet"],
+                "status": "pending",
+                "created_at": now_iso(),
+                "ref": "",
+            }
+        )
+        data["next_payout_id"] = pid + 1
+        save_data(data)
+    amount_cur = points_to_currency(amount)
+    if ADMIN_IDS:
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Pay", callback_data=f"payapprove:{pid}"),
+                    InlineKeyboardButton("❌ Reject", callback_data=f"payreject:{pid}"),
+                ]
+            ]
+        )
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"💸 Payout #{pid} from {user.first_name}\n"
+                    f"{amount} pts = {CURRENCY} {amount_cur}\n"
+                    f"To: {u['wallet']}",
+                    reply_markup=kb,
+                )
+            except Exception:
+                pass
+    await update.message.reply_text(
+        f"📤 Payout request #{pid} submitted: {amount} pts ({CURRENCY} {amount_cur}).\n"
+        f"An admin will process it to `{u['wallet']}`.",
+        parse_mode="Markdown",
+    )
+
+
+async def mypayouts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    with lock:
+        data = load_data()
+        mine = [p for p in data["payouts"] if p["user_id"] == user.id]
+    if not mine:
+        await update.message.reply_text("You have no payout requests.")
+        return
+    lines = [f"💵 *Your payouts* (rate {PAYOUT_RATE} pts = {CURRENCY} 1):"]
+    for p in mine:
+        lines.append(
+            f"`#{p['id']}` {p['points']} pts → {CURRENCY} {points_to_currency(p['points'])} "
+            f"— _{p['status']}_"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def payouts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    with lock:
+        data = load_data()
+        pending = [p for p in data["payouts"] if p["status"] == "pending"]
+    if not pending:
+        await update.message.reply_text("No pending payouts.")
+        return
+    lines = ["💸 *Pending payouts:*"]
+    for p in pending:
+        name = data["users"].get(str(p["user_id"]), {}).get("first_name", str(p["user_id"]))
+        lines.append(
+            f"`#{p['id']}` {name}: {p['points']} pts = {CURRENCY} {points_to_currency(p['points'])} → {p['address']}"
+        )
+    lines.append("\nApprove: /approvepayout <id> <ref>  ·  Reject: /rejectpayout <id>")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def _resolve_payout(target, context, pid, approve, ref="", edit=False):
+    with lock:
+        data = load_data()
+        p = next((x for x in data["payouts"] if x["id"] == pid), None)
+        if not p:
+            msg = "Payout not found."
+        elif p["status"] != "pending":
+            msg = f"Payout #{pid} is already {p['status']}."
+        elif approve:
+            u = data["users"].get(str(p["user_id"]))
+            if u and u["points"] >= p["points"]:
+                u["points"] -= p["points"]
+            p["status"] = "paid"
+            p["ref"] = ref
+            msg = f"✅ Payout #{pid} marked paid. {p['points']} pts deducted."
+            if u:
+                try:
+                    await context.bot.send_message(
+                        p["user_id"],
+                        f"💰 Payout #{pid} of {p['points']} pts ({CURRENCY} {points_to_currency(p['points'])}) "
+                        f"was sent to `{p['address']}`. Ref: {ref or '-'}",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+        else:
+            p["status"] = "rejected"
+            msg = f"❌ Payout #{pid} rejected."
+        save_data(data)
+    if edit:
+        await target.edit_message_text(msg)
+    else:
+        await target.message.reply_text(msg)
+
+
+async def approvepayout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if len(context.args) < 1:
+        await update.message.reply_text("Usage: /approvepayout <id> [ref]")
+        return
+    try:
+        pid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid payout id.")
+        return
+    ref = " ".join(context.args[1:])
+    await _resolve_payout(update, context, pid, True, ref)
+
+
+async def rejectpayout(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /rejectpayout <id>")
+        return
+    try:
+        pid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("Invalid payout id.")
+        return
+    await _resolve_payout(update, context, pid, False)
+
+
 async def addtask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("⛔ Admin only.")
@@ -263,9 +466,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(query.from_user.id):
         await query.edit_message_text("⛔ Admin only.")
         return
-    action, tid = query.data.split(":")
-    tid = int(tid)
-    await _resolve_task(query, context, tid, action == "approve", edit=True)
+    data = query.data
+    if data.startswith("pay"):
+        action, pid = data.split(":")
+        pid = int(pid)
+        await _resolve_payout(query, context, pid, action == "payapprove", edit=True)
+    else:
+        action, tid = data.split(":")
+        tid = int(tid)
+        await _resolve_task(query, context, tid, action == "approve", edit=True)
 
 
 async def _resolve_task(target, context, tid, approve, edit=False):
@@ -328,8 +537,14 @@ def main():
     app.add_handler(CommandHandler("done", done))
     app.add_handler(CommandHandler("balance", balance))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
+    app.add_handler(CommandHandler("setwallet", setwallet))
+    app.add_handler(CommandHandler("payout", payout))
+    app.add_handler(CommandHandler("mypayouts", mypayouts))
     app.add_handler(CommandHandler("addtask", addtask))
     app.add_handler(CommandHandler("verify", verify))
+    app.add_handler(CommandHandler("payouts", payouts))
+    app.add_handler(CommandHandler("approvepayout", approvepayout))
+    app.add_handler(CommandHandler("rejectpayout", rejectpayout))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CallbackQueryHandler(button))
 
